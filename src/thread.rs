@@ -31,6 +31,7 @@ use codex_core::{
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
 };
+use codex_core_skills::{SkillMetadata, SkillsLoadInput, SkillsManager};
 use codex_login::auth::AuthManager;
 use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
 use codex_protocol::{
@@ -326,6 +327,7 @@ impl Thread {
         models_manager: Arc<dyn ModelsManagerImpl>,
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
         config: Config,
+        skills_manager: Option<Arc<SkillsManager>>,
         cx: ConnectionTo<Client>,
     ) -> Self {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
@@ -337,6 +339,7 @@ impl Thread {
             thread.clone(),
             models_manager,
             config,
+            skills_manager,
             message_rx,
             resolution_tx,
             resolution_rx,
@@ -1462,6 +1465,8 @@ impl PromptState {
             | EventMsg::HookCompleted(..)
             // we already have a way to diff the turn, so ignore
             | EventMsg::TurnDiff(..)
+            // Skills updates are intercepted at the ThreadActor level so we can refresh
+            // the cache and re-emit AvailableCommandsUpdate session-wide.
             | EventMsg::SkillsUpdateAvailable
             // Old events
             | EventMsg::RawResponseItem(..)
@@ -2741,6 +2746,12 @@ struct ThreadActor<A> {
     config: Config,
     /// The models available for this thread.
     models_manager: Arc<dyn ModelsManagerImpl>,
+    /// Codex skills manager, when available. `None` in tests.
+    skills_manager: Option<Arc<SkillsManager>>,
+    /// Cached skills available for this thread's working directory. Refreshed at session
+    /// load and whenever Codex emits `SkillsUpdateAvailable`. Used to advertise skills as
+    /// ACP slash commands and to route invocations back to Codex via `$name` rewriting.
+    cached_skills: Vec<SkillMetadata>,
     /// Internal message sender used to route spawned interaction results back to the actor.
     resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
     /// A sender for each interested `Op` submission that needs events routed.
@@ -2761,6 +2772,7 @@ impl<A: Auth> ThreadActor<A> {
         thread: Arc<dyn CodexThreadImpl>,
         models_manager: Arc<dyn ModelsManagerImpl>,
         config: Config,
+        skills_manager: Option<Arc<SkillsManager>>,
         message_rx: mpsc::UnboundedReceiver<ThreadMessage>,
         resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
         resolution_rx: mpsc::UnboundedReceiver<ThreadMessage>,
@@ -2771,6 +2783,8 @@ impl<A: Auth> ThreadActor<A> {
             thread,
             config,
             models_manager,
+            skills_manager,
+            cached_skills: Vec::new(),
             resolution_tx,
             submissions: HashMap::new(),
             message_rx,
@@ -2814,13 +2828,15 @@ impl<A: Auth> ThreadActor<A> {
             ThreadMessage::Load { response_tx } => {
                 let result = self.handle_load().await;
                 drop(response_tx.send(result));
+                self.refresh_skills().await;
                 let client = self.client.clone();
+                let commands = self.available_commands();
                 // Have this happen after the session is loaded by putting it
                 // in a separate task
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     client.send_notification(SessionUpdate::AvailableCommandsUpdate(
-                        AvailableCommandsUpdate::new(Self::builtin_commands()),
+                        AvailableCommandsUpdate::new(commands),
                     ));
                 });
             }
@@ -2922,6 +2938,69 @@ impl<A: Auth> ThreadActor<A> {
             ),
             AvailableCommand::new("logout", "logout of Codex"),
         ]
+    }
+
+    /// Builtin slash command names. Used to detect collisions with skill names so a skill
+    /// cannot shadow a builtin like `/init` or `/compact`.
+    fn builtin_command_names() -> &'static [&'static str] {
+        &[
+            "review",
+            "review-branch",
+            "review-commit",
+            "init",
+            "compact",
+            "logout",
+        ]
+    }
+
+    /// Available slash commands for this session: builtins plus any skills cached for the
+    /// current cwd. Skills whose names collide with a builtin are dropped (with a warning).
+    fn available_commands(&self) -> Vec<AvailableCommand> {
+        let mut commands = Self::builtin_commands();
+        let builtins = Self::builtin_command_names();
+        for skill in &self.cached_skills {
+            if builtins.contains(&skill.name.as_str()) {
+                tracing::warn!(
+                    skill = %skill.name,
+                    "skipping skill because its name collides with a builtin slash command"
+                );
+                continue;
+            }
+            let description = skill
+                .short_description
+                .clone()
+                .unwrap_or_else(|| skill.description.clone());
+            commands.push(AvailableCommand::new(skill.name.clone(), description));
+        }
+        commands
+    }
+
+    /// Refresh `cached_skills` from the `SkillsManager`. No-op if the manager is absent
+    /// (e.g. in tests). Plugin-supplied skill roots are not yet wired through; only
+    /// user/project/system skills will appear.
+    async fn refresh_skills(&mut self) {
+        let Some(skills_manager) = self.skills_manager.clone() else {
+            return;
+        };
+        let input = SkillsLoadInput::new(
+            self.config.cwd.clone(),
+            Vec::new(),
+            self.config.config_layer_stack.clone(),
+            self.config.bundled_skills_enabled(),
+        );
+        let outcome = skills_manager
+            .skills_for_cwd(&input, /*force_reload*/ false, /*fs*/ None)
+            .await;
+        self.cached_skills = outcome.allowed_skills_for_implicit_invocation();
+    }
+
+    /// Returns `Some(name)` if `name` matches a cached skill that should be routed to
+    /// Codex via `$name` rewriting (i.e. not shadowed by a builtin).
+    fn skill_command_match(&self, name: &str) -> Option<&SkillMetadata> {
+        if Self::builtin_command_names().contains(&name) {
+            return None;
+        }
+        self.cached_skills.iter().find(|s| s.name == name)
     }
 
     fn modes(&self) -> Option<SessionModeState> {
@@ -3308,8 +3387,17 @@ impl<A: Auth> ThreadActor<A> {
                     return Err(Error::auth_required());
                 }
                 _ => {
+                    // If the slash command names a known skill, rewrite the leading
+                    // `/name` into `$name` so Codex's implicit-skill detection picks it
+                    // up the same way it does in the TUI's `$` skill picker.
+                    let rewritten_items =
+                        if self.skill_command_match(name).is_some() {
+                            rewrite_slash_to_skill_invocation(name, &items)
+                        } else {
+                            items
+                        };
                     op = Op::UserInput {
-                        items,
+                        items: rewritten_items,
                         final_output_json_schema: None,
                         environments: None,
                         responsesapi_client_metadata: None,
@@ -3801,6 +3889,16 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_event(&mut self, Event { id, msg }: Event) {
+        // Session-wide events that don't belong to any single submission. Intercept here
+        // before attempting submission routing.
+        if matches!(msg, EventMsg::SkillsUpdateAvailable) {
+            self.refresh_skills().await;
+            self.client
+                .send_notification(SessionUpdate::AvailableCommandsUpdate(
+                    AvailableCommandsUpdate::new(self.available_commands()),
+                ));
+            return;
+        }
         if let Some(submission) = self.submissions.get_mut(&id) {
             submission.handle_event(&self.client, msg).await;
         } else {
@@ -4191,6 +4289,39 @@ fn generate_fallback_id(prefix: &str) -> String {
     format!("{}_{}", prefix, Uuid::new_v4())
 }
 
+/// Rewrites a slash-prefixed skill invocation (`/name rest...`) in the leading text item
+/// into Codex's implicit-skill form (`$name rest...`). Non-text items are preserved as-is,
+/// and a missing/empty leading text item becomes a single text item carrying just `$name`.
+///
+/// This is the bridge that lets Zed's slash-command palette invoke a Codex skill: the user
+/// picks `/wispr-flow` from the menu, and we hand Codex the same `$wispr-flow` text its TUI
+/// would have produced when the user typed `$` and selected the skill.
+fn rewrite_slash_to_skill_invocation(name: &str, items: &[UserInput]) -> Vec<UserInput> {
+    let mut rewritten: Vec<UserInput> = items.to_vec();
+    if let Some(first) = rewritten.first_mut()
+        && let UserInput::Text { text, .. } = first
+    {
+        let stripped = text.strip_prefix('/').unwrap_or(text);
+        let after_name = stripped.get(name.len()..).unwrap_or("").trim_start();
+        *text = if after_name.is_empty() {
+            format!("${name}")
+        } else {
+            format!("${name} {after_name}")
+        };
+        return rewritten;
+    }
+    // No leading text item — prepend one so the `$name` mention is the first thing Codex
+    // sees in the user's input.
+    rewritten.insert(
+        0,
+        UserInput::Text {
+            text: format!("${name}"),
+            text_elements: vec![],
+        },
+    );
+    rewritten
+}
+
 /// Checks if a prompt is slash command
 fn extract_slash_command(content: &[UserInput]) -> Option<(&str, &str)> {
     let line = content.first().and_then(|block| match block {
@@ -4231,6 +4362,70 @@ mod tests {
     use tokio::sync::{Mutex, Notify, mpsc::UnboundedSender};
 
     use super::*;
+
+    fn text_input(text: &str) -> UserInput {
+        UserInput::Text {
+            text: text.into(),
+            text_elements: vec![],
+        }
+    }
+
+    fn first_text(items: &[UserInput]) -> &str {
+        match items.first() {
+            Some(UserInput::Text { text, .. }) => text.as_str(),
+            _ => "",
+        }
+    }
+
+    #[test]
+    fn rewrite_slash_to_skill_invocation_with_args() {
+        let items = vec![text_input("/wispr-flow do thing")];
+        let out = rewrite_slash_to_skill_invocation("wispr-flow", &items);
+        assert_eq!(first_text(&out), "$wispr-flow do thing");
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn rewrite_slash_to_skill_invocation_without_args() {
+        let items = vec![text_input("/morning-briefing")];
+        let out = rewrite_slash_to_skill_invocation("morning-briefing", &items);
+        assert_eq!(first_text(&out), "$morning-briefing");
+    }
+
+    #[test]
+    fn rewrite_slash_to_skill_invocation_preserves_trailing_items() {
+        let items = vec![
+            text_input("/slack-send hello"),
+            UserInput::Image {
+                image_url: "data:image/png;base64,AAAA".into(),
+            },
+        ];
+        let out = rewrite_slash_to_skill_invocation("slack-send", &items);
+        assert_eq!(first_text(&out), "$slack-send hello");
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[1], UserInput::Image { .. }));
+    }
+
+    #[test]
+    fn rewrite_slash_to_skill_invocation_collapses_extra_whitespace_after_name() {
+        // The slash dispatcher hands us the original first-line text untouched, including
+        // the user's spacing after the name. We trim leading whitespace before the args
+        // so the rewritten text reads naturally to Codex.
+        let items = vec![text_input("/foo    bar  baz")];
+        let out = rewrite_slash_to_skill_invocation("foo", &items);
+        assert_eq!(first_text(&out), "$foo bar  baz");
+    }
+
+    #[test]
+    fn rewrite_slash_to_skill_invocation_prepends_text_when_first_item_is_image() {
+        let items = vec![UserInput::Image {
+            image_url: "data:image/png;base64,AAAA".into(),
+        }];
+        let out = rewrite_slash_to_skill_invocation("wispr-flow", &items);
+        assert_eq!(out.len(), 2);
+        assert_eq!(first_text(&out), "$wispr-flow");
+        assert!(matches!(out[1], UserInput::Image { .. }));
+    }
 
     #[tokio::test]
     async fn test_prompt() -> anyhow::Result<()> {
@@ -4775,6 +4970,7 @@ mod tests {
             conversation.clone(),
             models_manager,
             config,
+            None,
             message_rx,
             resolution_tx,
             resolution_rx,
@@ -5647,6 +5843,7 @@ mod tests {
             conversation.clone(),
             models_manager,
             config,
+            None,
             message_rx,
             resolution_tx,
             resolution_rx,

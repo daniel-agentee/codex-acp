@@ -573,6 +573,7 @@ impl CodexAgent {
             Arc::new(self.thread_manager.get_models_manager()),
             self.client_capabilities.clone(),
             config.clone(),
+            Some(self.thread_manager.skills_manager()),
             cx,
         ));
         let load = thread.load().await?;
@@ -647,6 +648,7 @@ impl CodexAgent {
             Arc::new(self.thread_manager.get_models_manager()),
             self.client_capabilities.clone(),
             config.clone(),
+            Some(self.thread_manager.skills_manager()),
             cx,
         ));
 

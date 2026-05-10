@@ -18,6 +18,9 @@ This tool implements an ACP adapter around the Codex CLI, supporting:
   - /compact
   - /logout
   - Custom Prompts
+- Skills as slash commands: any Codex skill discovered for the session's working
+  directory is exposed as a slash command (e.g. `/code-review`). Selecting one
+  is equivalent to invoking the skill via `$name` in the Codex CLI's TUI.
 - Client MCP servers
 - Auth Methods:
   - ChatGPT subscription (requires paid subscription and doesn't work in remote projects)
