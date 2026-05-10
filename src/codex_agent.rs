@@ -18,6 +18,7 @@ use codex_core::{
     NewThread, RolloutRecorder, StateDbHandle, ThreadManager, config::Config,
     find_thread_path_by_id_str, init_state_db, resolve_installation_id, thread_store_from_config,
 };
+use codex_core_skills::SkillsLoadInput;
 use codex_exec_server::{EnvironmentManager, ExecServerRuntimePaths};
 use codex_extension_api::empty_extension_registry;
 use codex_login::{
@@ -434,6 +435,22 @@ impl CodexAgent {
 
         Ok(config)
     }
+
+    async fn skills_load_input_for_config(&self, config: &Config) -> SkillsLoadInput {
+        let plugins_input = config.plugins_config_input();
+        let effective_skill_roots = self
+            .thread_manager
+            .plugins_manager()
+            .effective_skill_roots_for_layer_stack(&config.config_layer_stack, &plugins_input)
+            .await;
+
+        SkillsLoadInput::new(
+            config.cwd.clone(),
+            effective_skill_roots,
+            config.config_layer_stack.clone(),
+            config.bundled_skills_enabled(),
+        )
+    }
 }
 
 impl CodexAgent {
@@ -588,6 +605,8 @@ impl CodexAgent {
             Arc::new(self.thread_manager.get_models_manager()),
             self.client_capabilities.clone(),
             config.clone(),
+            Some(self.thread_manager.skills_manager()),
+            Some(self.skills_load_input_for_config(&config).await),
             cx,
         ));
         let load = thread.load().await?;
@@ -702,6 +721,8 @@ impl CodexAgent {
             Arc::new(self.thread_manager.get_models_manager()),
             self.client_capabilities.clone(),
             config.clone(),
+            Some(self.thread_manager.skills_manager()),
+            Some(self.skills_load_input_for_config(&config).await),
             cx,
         ));
 

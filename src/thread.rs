@@ -4,7 +4,6 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, LazyLock, Mutex},
-    time::Duration,
 };
 
 use agent_client_protocol::{
@@ -31,6 +30,8 @@ use codex_core::{
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
 };
+use codex_core_skills::{SkillLoadOutcome, SkillMetadata, SkillsLoadInput, SkillsManager};
+use codex_exec_server::LOCAL_FS;
 use codex_login::auth::AuthManager;
 use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
 use codex_protocol::{
@@ -82,6 +83,7 @@ use heck::ToTitleCase;
 use itertools::Itertools;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::sleep;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -317,6 +319,7 @@ pub struct Thread {
 }
 
 impl Thread {
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         session_id: SessionId,
         thread: Arc<dyn CodexThreadImpl>,
@@ -324,6 +327,8 @@ impl Thread {
         models_manager: Arc<dyn ModelsManagerImpl>,
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
         config: Config,
+        skills_manager: Option<Arc<SkillsManager>>,
+        skills_load_input: Option<SkillsLoadInput>,
         cx: ConnectionTo<Client>,
     ) -> Self {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
@@ -335,6 +340,8 @@ impl Thread {
             thread.clone(),
             models_manager,
             config,
+            skills_manager,
+            skills_load_input,
             message_rx,
             resolution_tx,
             resolution_rx,
@@ -2749,6 +2756,13 @@ struct ThreadActor<A> {
     config: Config,
     /// The models available for this thread.
     models_manager: Arc<dyn ModelsManagerImpl>,
+    /// Codex skills manager, when available. `None` in tests.
+    skills_manager: Option<Arc<SkillsManager>>,
+    /// Skill-loading input for this session, including effective plugin skill roots.
+    skills_load_input: Option<SkillsLoadInput>,
+    /// Enabled skills advertised as ACP slash commands for this session's current cwd.
+    /// Refreshed at session load.
+    cached_slash_command_skills: Vec<SkillMetadata>,
     /// Internal message sender used to route spawned interaction results back to the actor.
     resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
     /// A sender for each interested `Op` submission that needs events routed.
@@ -2769,6 +2783,8 @@ impl<A: Auth> ThreadActor<A> {
         thread: Arc<dyn CodexThreadImpl>,
         models_manager: Arc<dyn ModelsManagerImpl>,
         config: Config,
+        skills_manager: Option<Arc<SkillsManager>>,
+        skills_load_input: Option<SkillsLoadInput>,
         message_rx: mpsc::UnboundedReceiver<ThreadMessage>,
         resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
         resolution_rx: mpsc::UnboundedReceiver<ThreadMessage>,
@@ -2779,6 +2795,9 @@ impl<A: Auth> ThreadActor<A> {
             thread,
             config,
             models_manager,
+            skills_manager,
+            skills_load_input,
+            cached_slash_command_skills: Vec::new(),
             resolution_tx,
             submissions: HashMap::new(),
             message_rx,
@@ -2822,15 +2841,8 @@ impl<A: Auth> ThreadActor<A> {
             ThreadMessage::Load { response_tx } => {
                 let result = self.handle_load().await;
                 drop(response_tx.send(result));
-                let client = self.client.clone();
-                // Have this happen after the session is loaded by putting it
-                // in a separate task
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    client.send_notification(SessionUpdate::AvailableCommandsUpdate(
-                        AvailableCommandsUpdate::new(Self::builtin_commands()),
-                    ));
-                });
+                self.refresh_skills().await;
+                self.send_available_commands_update_after_session_visible();
             }
             ThreadMessage::GetConfigOptions { response_tx } => {
                 let result = self.config_options().await;
@@ -2931,6 +2943,128 @@ impl<A: Auth> ThreadActor<A> {
             ),
             AvailableCommand::new("logout", "logout of Codex"),
         ]
+    }
+
+    /// Builtin slash command names. Used to detect collisions with skill names so a skill
+    /// cannot shadow a builtin like `/init` or `/compact`.
+    fn builtin_command_names() -> &'static [&'static str] {
+        &[
+            "review",
+            "review-branch",
+            "review-commit",
+            "init",
+            "compact",
+            "logout",
+        ]
+    }
+
+    /// Available slash commands for this session: builtins plus any skills cached for the
+    /// current cwd. Skills whose names collide with a builtin are dropped (with a warning).
+    fn available_commands(&self) -> Vec<AvailableCommand> {
+        let mut commands = Self::builtin_commands();
+        commands.extend(Self::skill_commands(&self.cached_slash_command_skills));
+        commands
+    }
+
+    fn skill_commands(skills: &[SkillMetadata]) -> Vec<AvailableCommand> {
+        let builtins = Self::builtin_command_names();
+        let mut seen_skill_names = HashSet::new();
+        let mut commands = Vec::new();
+        for skill in skills {
+            if builtins.contains(&skill.name.as_str()) {
+                tracing::warn!(
+                    skill = %skill.name,
+                    "skipping skill because its name collides with a builtin slash command"
+                );
+                continue;
+            }
+            if extract_slash_command(&[text_input_for_skill_command(&skill.name)])
+                != Some((skill.name.as_str(), ""))
+            {
+                tracing::warn!(
+                    skill = %skill.name,
+                    "skipping skill because its name cannot round-trip through slash command parsing"
+                );
+                continue;
+            }
+            if !seen_skill_names.insert(skill.name.as_str()) {
+                tracing::warn!(
+                    skill = %skill.name,
+                    "skipping duplicate skill slash command name"
+                );
+                continue;
+            }
+            let description = skill
+                .short_description
+                .clone()
+                .unwrap_or_else(|| skill.description.clone());
+            commands.push(AvailableCommand::new(skill.name.clone(), description));
+        }
+        commands
+    }
+
+    fn send_available_commands_update_after_session_visible(&self) {
+        let client = self.client.clone();
+        let commands = self.available_commands();
+        tokio::spawn(async move {
+            sleep(std::time::Duration::from_millis(200)).await;
+            client.send_notification(SessionUpdate::AvailableCommandsUpdate(
+                AvailableCommandsUpdate::new(commands),
+            ));
+        });
+    }
+
+    fn cached_skills_from_outcome(outcome: &SkillLoadOutcome) -> Vec<SkillMetadata> {
+        outcome
+            .skills_with_enabled()
+            .filter(|(_, enabled)| *enabled)
+            .map(|(skill, _)| skill.clone())
+            .collect()
+    }
+
+    /// Refresh cached skill command metadata from the `SkillsManager`. No-op if the manager/input
+    /// is absent (e.g. in tests).
+    async fn refresh_skills(&mut self) {
+        let Some(skills_manager) = self.skills_manager.clone() else {
+            return;
+        };
+        let Some(input) = self.skills_load_input.as_ref() else {
+            return;
+        };
+        let outcome = skills_manager
+            .skills_for_config(input, Some(Arc::clone(&LOCAL_FS)))
+            .await;
+        self.cached_slash_command_skills = Self::cached_skills_from_outcome(&outcome);
+    }
+
+    async fn reload_skills_after_invalidation(&mut self) {
+        if let Some(skills_manager) = &self.skills_manager {
+            skills_manager.clear_cache();
+        }
+        self.refresh_skills().await;
+    }
+
+    /// Returns `Some(name)` if `name` matches a cached skill that should be routed to
+    /// Codex via `$name` rewriting (i.e. not shadowed by a builtin).
+    fn skill_command_match(&self, name: &str) -> Option<&SkillMetadata> {
+        Self::skill_command_match_in(name, &self.cached_slash_command_skills)
+    }
+
+    fn skill_command_match_in<'a>(
+        name: &str,
+        skills: &'a [SkillMetadata],
+    ) -> Option<&'a SkillMetadata> {
+        if Self::builtin_command_names().contains(&name) {
+            return None;
+        }
+        skills.iter().find(|s| s.name == name)
+    }
+
+    fn event_invalidates_skill_commands(event: &EventMsg) -> bool {
+        matches!(
+            event,
+            EventMsg::SessionConfigured(..) | EventMsg::ThreadSettingsApplied(..)
+        )
     }
 
     fn modes(&self) -> Option<SessionModeState> {
@@ -3239,8 +3373,15 @@ impl<A: Auth> ThreadActor<A> {
                     return Err(Error::auth_required());
                 }
                 _ => {
+                    // If the slash command names a known skill, preserve the cached
+                    // skill path so duplicate names still route to a concrete skill.
+                    let rewritten_items = if let Some(skill) = self.skill_command_match(name) {
+                        rewrite_slash_to_skill_invocation(skill, &items)
+                    } else {
+                        items
+                    };
                     op = Op::UserInput {
-                        items,
+                        items: rewritten_items,
                         final_output_json_schema: None,
                         environments: None,
                         responsesapi_client_metadata: None,
@@ -3686,10 +3827,17 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_event(&mut self, Event { id, msg }: Event) {
+        let refresh_skill_commands = Self::event_invalidates_skill_commands(&msg);
+
         if let Some(submission) = self.submissions.get_mut(&id) {
             submission.handle_event(&self.client, msg).await;
-        } else {
+        } else if !refresh_skill_commands {
             warn!("Received event for unknown submission ID: {id} {msg:?}");
+        }
+
+        if refresh_skill_commands {
+            self.reload_skills_after_invalidation().await;
+            self.send_available_commands_update_after_session_visible();
         }
     }
 }
@@ -4077,6 +4225,44 @@ fn generate_fallback_id(prefix: &str) -> String {
     format!("{}_{}", prefix, Uuid::new_v4())
 }
 
+fn text_input_for_skill_command(name: &str) -> UserInput {
+    UserInput::Text {
+        text: format!("/{name}"),
+        text_elements: Vec::new(),
+    }
+}
+
+/// Rewrites a slash-prefixed skill invocation (`/name rest...`) into Codex's structured
+/// skill-selection form. Non-text items are preserved as-is, and any text after the slash command
+/// name is kept as the user's prompt text.
+///
+/// This is the bridge that lets Zed's slash-command palette invoke a Codex skill: the user
+/// picks `/wispr-flow` from the menu, and we hand Codex the same path-aware skill selection its
+/// TUI would have produced when the user typed `$` and selected the skill.
+fn rewrite_slash_to_skill_invocation(skill: &SkillMetadata, items: &[UserInput]) -> Vec<UserInput> {
+    let mut rewritten = Vec::with_capacity(items.len() + 1);
+    rewritten.push(UserInput::Skill {
+        name: skill.name.clone(),
+        path: skill.path_to_skills_md.to_path_buf(),
+    });
+
+    if let Some(UserInput::Text { text, .. }) = items.first() {
+        let stripped = text.strip_prefix('/').unwrap_or(text);
+        let after_name = stripped.get(skill.name.len()..).unwrap_or("").trim_start();
+        if !after_name.is_empty() {
+            rewritten.push(UserInput::Text {
+                text: after_name.to_owned(),
+                text_elements: vec![],
+            });
+        }
+        rewritten.extend(items.iter().skip(1).cloned());
+    } else {
+        rewritten.extend(items.iter().cloned());
+    }
+
+    rewritten
+}
+
 /// Checks if a prompt is slash command
 fn extract_slash_command(content: &[UserInput]) -> Option<(&str, &str)> {
     let line = content.first().and_then(|block| match block {
@@ -4112,11 +4298,325 @@ mod tests {
 
     use agent_client_protocol::schema::{RequestPermissionResponse, TextContent};
     use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
+    use codex_core_skills::SkillPolicy;
     use codex_protocol::config_types::ModeKind;
-    use codex_protocol::{ThreadId, protocol::ThreadGoal};
+    use codex_protocol::{
+        ThreadId,
+        protocol::{SkillScope, ThreadGoal},
+    };
     use tokio::sync::{Mutex, Notify, mpsc::UnboundedSender};
 
     use super::*;
+
+    fn text_input(text: &str) -> UserInput {
+        UserInput::Text {
+            text: text.into(),
+            text_elements: vec![],
+        }
+    }
+
+    fn text_at(items: &[UserInput], index: usize) -> &str {
+        match items.get(index) {
+            Some(UserInput::Text { text, .. }) => text.as_str(),
+            _ => "",
+        }
+    }
+
+    fn assert_skill_item(item: &UserInput, skill: &SkillMetadata) {
+        match item {
+            UserInput::Skill { name, path } => {
+                assert_eq!(name, &skill.name);
+                assert_eq!(path, &skill.path_to_skills_md.to_path_buf());
+            }
+            other => panic!("expected skill item, got {other:?}"),
+        }
+    }
+
+    fn test_skill(name: &str, allow_implicit_invocation: Option<bool>) -> SkillMetadata {
+        SkillMetadata {
+            name: name.to_string(),
+            description: format!("{name} long description"),
+            short_description: Some(format!("{name} short")),
+            interface: None,
+            dependencies: None,
+            policy: allow_implicit_invocation.map(|allow_implicit_invocation| SkillPolicy {
+                allow_implicit_invocation: Some(allow_implicit_invocation),
+                products: Vec::new(),
+            }),
+            path_to_skills_md: PathBuf::from(format!("/tmp/{name}/SKILL.md"))
+                .try_into()
+                .unwrap(),
+            scope: SkillScope::User,
+            plugin_id: None,
+        }
+    }
+
+    #[test]
+    fn slash_command_cache_includes_and_routes_enabled_explicit_only_skills() {
+        let explicit_only = test_skill("explicit-only", Some(false));
+        let disabled = test_skill("disabled-skill", None);
+        let mut outcome = SkillLoadOutcome::default();
+        outcome.skills = vec![explicit_only.clone(), disabled.clone()];
+        outcome
+            .disabled_paths
+            .insert(disabled.path_to_skills_md.clone());
+
+        let slash_command_skills = ThreadActor::<StubAuth>::cached_skills_from_outcome(&outcome);
+        let commands = ThreadActor::<StubAuth>::skill_commands(&slash_command_skills);
+
+        assert!(commands.iter().any(|command| {
+            command.name == "explicit-only" && command.description == "explicit-only short"
+        }));
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.name == "disabled-skill")
+        );
+        assert!(
+            ThreadActor::<StubAuth>::skill_command_match_in("explicit-only", &slash_command_skills)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn slash_command_cache_keeps_enabled_default_skills_rewritable() {
+        let implicit_default = test_skill("implicit-default", None);
+        let implicit_enabled = test_skill("implicit-enabled", Some(true));
+        let mut outcome = SkillLoadOutcome::default();
+        outcome.skills = vec![implicit_default, implicit_enabled];
+
+        let slash_command_skills = ThreadActor::<StubAuth>::cached_skills_from_outcome(&outcome);
+
+        assert!(
+            ThreadActor::<StubAuth>::skill_command_match_in(
+                "implicit-default",
+                &slash_command_skills
+            )
+            .is_some()
+        );
+        assert!(
+            ThreadActor::<StubAuth>::skill_command_match_in(
+                "implicit-enabled",
+                &slash_command_skills
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn rewrite_slash_to_skill_invocation_with_args() {
+        let skill = test_skill("wispr-flow", None);
+        let items = vec![text_input("/wispr-flow do thing")];
+        let out = rewrite_slash_to_skill_invocation(&skill, &items);
+        assert_skill_item(&out[0], &skill);
+        assert_eq!(text_at(&out, 1), "do thing");
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn rewrite_slash_to_skill_invocation_without_args() {
+        let skill = test_skill("morning-briefing", None);
+        let items = vec![text_input("/morning-briefing")];
+        let out = rewrite_slash_to_skill_invocation(&skill, &items);
+        assert_skill_item(&out[0], &skill);
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn rewrite_slash_to_skill_invocation_preserves_trailing_items() {
+        let skill = test_skill("slack-send", None);
+        let items = vec![
+            text_input("/slack-send hello"),
+            UserInput::Image {
+                image_url: "data:image/png;base64,AAAA".into(),
+                detail: None,
+            },
+        ];
+        let out = rewrite_slash_to_skill_invocation(&skill, &items);
+        assert_skill_item(&out[0], &skill);
+        assert_eq!(text_at(&out, 1), "hello");
+        assert_eq!(out.len(), 3);
+        assert!(matches!(out[2], UserInput::Image { .. }));
+    }
+
+    #[test]
+    fn rewrite_slash_to_skill_invocation_collapses_extra_whitespace_after_name() {
+        // The slash dispatcher hands us the original first-line text untouched, including
+        // the user's spacing after the name. We trim leading whitespace before the args
+        // so the rewritten text reads naturally to Codex.
+        let skill = test_skill("foo", None);
+        let items = vec![text_input("/foo    bar  baz")];
+        let out = rewrite_slash_to_skill_invocation(&skill, &items);
+        assert_skill_item(&out[0], &skill);
+        assert_eq!(text_at(&out, 1), "bar  baz");
+    }
+
+    #[test]
+    fn rewrite_slash_to_skill_invocation_prepends_text_when_first_item_is_image() {
+        let skill = test_skill("wispr-flow", None);
+        let items = vec![UserInput::Image {
+            image_url: "data:image/png;base64,AAAA".into(),
+            detail: None,
+        }];
+        let out = rewrite_slash_to_skill_invocation(&skill, &items);
+        assert_eq!(out.len(), 2);
+        assert_skill_item(&out[0], &skill);
+        assert!(matches!(out[1], UserInput::Image { .. }));
+    }
+
+    #[test]
+    fn rewrite_slash_to_skill_invocation_preserves_duplicate_skill_path() {
+        let first = test_skill("duplicate", None);
+        let mut second = test_skill("duplicate", None);
+        second.path_to_skills_md = PathBuf::from("/tmp/other-duplicate/SKILL.md")
+            .try_into()
+            .unwrap();
+        let skills = vec![first.clone(), second];
+        let matched =
+            ThreadActor::<StubAuth>::skill_command_match_in("duplicate", &skills).unwrap();
+
+        let out =
+            rewrite_slash_to_skill_invocation(matched, &[text_input("/duplicate use this one")]);
+
+        assert_skill_item(&out[0], &first);
+        assert_eq!(text_at(&out, 1), "use this one");
+    }
+
+    #[test]
+    fn skill_commands_deduplicates_duplicate_names() {
+        let first = test_skill("duplicate", None);
+        let mut second = test_skill("duplicate", None);
+        second.short_description = Some("second duplicate".to_string());
+        let commands = ThreadActor::<StubAuth>::skill_commands(&[first, second]);
+
+        let duplicate_commands = commands
+            .iter()
+            .filter(|command| command.name == "duplicate")
+            .collect::<Vec<_>>();
+
+        assert_eq!(duplicate_commands.len(), 1);
+        assert_eq!(duplicate_commands[0].description, "duplicate short");
+    }
+
+    #[test]
+    fn skill_commands_skips_names_that_cannot_round_trip_through_slash_parsing() {
+        let mut invalid = test_skill("two words", None);
+        invalid.short_description = Some("invalid command".to_string());
+        let valid = test_skill("one-word", None);
+
+        let commands = ThreadActor::<StubAuth>::skill_commands(&[invalid, valid]);
+
+        assert!(!commands.iter().any(|command| command.name == "two words"));
+        assert!(commands.iter().any(|command| {
+            command.name == "one-word" && command.description == "one-word short"
+        }));
+    }
+
+    #[tokio::test]
+    async fn refresh_skills_loads_repo_skill_commands() -> anyhow::Result<()> {
+        let root = std::env::temp_dir().join(format!("codex-acp-repo-skills-{}", Uuid::new_v4()));
+        let cwd = root.join("repo");
+        let codex_home = root.join("codex-home");
+        let dot_codex = cwd.join(".codex");
+        let skill_dir = dot_codex.join("skills/repo-helper");
+        std::fs::create_dir_all(dot_codex.join("skills"))?;
+        std::fs::create_dir_all(&codex_home)?;
+
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        config.cwd = cwd.clone().try_into()?;
+        config.codex_home = codex_home.clone().try_into()?;
+        config.config_layer_stack = codex_config::ConfigLayerStack::new(
+            vec![codex_config::ConfigLayerEntry::new(
+                codex_config::ConfigLayerSource::Project {
+                    dot_codex_folder: dot_codex.try_into()?,
+                },
+                codex_config::TomlValue::Table(Default::default()),
+            )],
+            Default::default(),
+            codex_config::ConfigRequirementsToml::default(),
+        )?;
+
+        let skills_load_input = SkillsLoadInput::new(
+            config.cwd.clone(),
+            Vec::new(),
+            config.config_layer_stack.clone(),
+            config.bundled_skills_enabled(),
+        );
+        let skills_manager = Arc::new(SkillsManager::new(
+            config.codex_home.clone(),
+            config.bundled_skills_enabled(),
+        ));
+        let event_cwd = config.cwd.clone();
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::new());
+        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let conversation = Arc::new(StubCodexThread::new());
+        let models_manager = Arc::new(StubModelsManager);
+        let (_message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut actor = ThreadActor::new(
+            StubAuth,
+            session_client,
+            conversation,
+            models_manager,
+            config,
+            Some(skills_manager),
+            Some(skills_load_input),
+            message_rx,
+            resolution_tx,
+            resolution_rx,
+        );
+
+        actor.refresh_skills().await;
+        assert!(actor.skill_command_match("repo-helper").is_none());
+
+        std::fs::create_dir_all(&skill_dir)?;
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: repo-helper\ndescription: repo skill command\n---\n\n# Body\n",
+        )?;
+        actor
+            .handle_event(Event {
+                id: "session".to_string(),
+                msg: EventMsg::SessionConfigured(
+                    codex_protocol::protocol::SessionConfiguredEvent {
+                        session_id: codex_protocol::SessionId::new(),
+                        thread_id: codex_protocol::ThreadId::new(),
+                        forked_from_id: None,
+                        parent_thread_id: None,
+                        thread_source: None,
+                        thread_name: None,
+                        model: "test-model".to_string(),
+                        model_provider_id: "test-provider".to_string(),
+                        service_tier: None,
+                        approval_policy: codex_protocol::protocol::AskForApproval::Never,
+                        approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
+                        permission_profile: PermissionProfile::read_only(),
+                        active_permission_profile: None,
+                        cwd: event_cwd,
+                        reasoning_effort: None,
+                        initial_messages: None,
+                        network_proxy: None,
+                        rollout_path: None,
+                    },
+                ),
+            })
+            .await;
+
+        let skill = actor
+            .skill_command_match("repo-helper")
+            .expect("repo-local skill should be cached as slash command");
+        assert_eq!(skill.description, "repo skill command");
+        assert!(actor.available_commands().iter().any(|command| {
+            command.name == "repo-helper" && command.description == "repo skill command"
+        }));
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_prompt() -> anyhow::Result<()> {
@@ -4660,6 +5160,8 @@ mod tests {
             conversation.clone(),
             models_manager,
             config,
+            None,
+            None,
             message_rx,
             resolution_tx,
             resolution_rx,
@@ -5642,6 +6144,8 @@ mod tests {
             conversation.clone(),
             models_manager,
             config,
+            None,
+            None,
             message_rx,
             resolution_tx,
             resolution_rx,

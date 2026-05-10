@@ -1610,6 +1610,7 @@ dependencies = [
  "codex-arg0",
  "codex-config",
  "codex-core",
+ "codex-core-skills",
  "codex-exec-server",
  "codex-extension-api",
  "codex-login",
