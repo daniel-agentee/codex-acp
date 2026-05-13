@@ -26,7 +26,7 @@ use agent_client_protocol::{
 };
 use codex_apply_patch::parse_patch;
 use codex_core::{
-    CodexThread,
+    CodexThread, append_thread_name,
     config::{Config, set_project_trust_level},
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
@@ -35,6 +35,7 @@ use codex_core_skills::{SkillMetadata, SkillsLoadInput, SkillsManager};
 use codex_login::auth::AuthManager;
 use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
 use codex_protocol::{
+    ThreadId,
     approvals::{
         ElicitationRequest, ElicitationRequestEvent, GuardianAssessmentAction,
         GuardianCommandSource,
@@ -288,6 +289,10 @@ enum ThreadMessage {
         model: ModelId,
         response_tx: oneshot::Sender<Result<(), Error>>,
     },
+    SetTitle {
+        title: String,
+        response_tx: oneshot::Sender<Result<(), Error>>,
+    },
     SetConfigOption {
         config_id: SessionConfigId,
         value: SessionConfigOptionValue,
@@ -406,6 +411,20 @@ impl Thread {
         let (response_tx, response_rx) = oneshot::channel();
 
         let message = ThreadMessage::SetModel { model, response_tx };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
+    }
+
+    pub async fn set_title(&self, title: impl Into<String>) -> Result<(), Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ThreadMessage::SetTitle {
+            title: title.into(),
+            response_tx,
+        };
         drop(self.message_tx.send(message));
 
         response_rx
@@ -2861,6 +2880,10 @@ impl<A: Auth> ThreadActor<A> {
                 drop(response_tx.send(result));
                 self.maybe_emit_config_options_update().await;
             }
+            ThreadMessage::SetTitle { title, response_tx } => {
+                let result = self.handle_set_title(title).await;
+                drop(response_tx.send(result));
+            }
             ThreadMessage::SetConfigOption {
                 config_id,
                 value,
@@ -3390,12 +3413,11 @@ impl<A: Auth> ThreadActor<A> {
                     // If the slash command names a known skill, rewrite the leading
                     // `/name` into `$name` so Codex's implicit-skill detection picks it
                     // up the same way it does in the TUI's `$` skill picker.
-                    let rewritten_items =
-                        if self.skill_command_match(name).is_some() {
-                            rewrite_slash_to_skill_invocation(name, &items)
-                        } else {
-                            items
-                        };
+                    let rewritten_items = if self.skill_command_match(name).is_some() {
+                        rewrite_slash_to_skill_invocation(name, &items)
+                    } else {
+                        items
+                    };
                     op = Op::UserInput {
                         items: rewritten_items,
                         final_output_json_schema: None,
@@ -3478,6 +3500,19 @@ impl<A: Auth> ThreadActor<A> {
                 TrustLevel::Trusted,
             )?;
         }
+
+        Ok(())
+    }
+
+    async fn handle_set_title(&mut self, title: String) -> Result<(), Error> {
+        let thread_id =
+            ThreadId::from_string(&self.client.session_id.0).map_err(Error::into_internal_error)?;
+
+        append_thread_name(&self.config.codex_home, thread_id, &title)
+            .await
+            .map_err(|err| {
+                Error::internal_error().data(format!("failed to index thread title: {err}"))
+            })?;
 
         Ok(())
     }
@@ -4978,6 +5013,58 @@ mod tests {
 
         let handle = tokio::spawn(actor.spawn());
         Ok((session_id, client, conversation, message_tx, handle))
+    }
+
+    #[tokio::test]
+    async fn test_set_session_title_renames_underlying_thread() -> anyhow::Result<()> {
+        let thread_id = ThreadId::default();
+        let session_id = SessionId::new(thread_id.to_string());
+        let client = Arc::new(StubClient::new());
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
+        let conversation = Arc::new(StubCodexThread::new());
+        let models_manager = Arc::new(StubModelsManager);
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        let codex_home = std::env::temp_dir().join(format!("codex-acp-title-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&codex_home)?;
+        config.codex_home = codex_home.clone().try_into()?;
+        let codex_home_abs = config.codex_home.clone();
+
+        let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+        let actor = ThreadActor::new(
+            StubAuth,
+            session_client,
+            conversation.clone(),
+            models_manager,
+            config,
+            None,
+            message_rx,
+            resolution_tx,
+            resolution_rx,
+        );
+
+        let thread = Thread {
+            thread: conversation,
+            message_tx,
+            _handle: tokio::spawn(actor.spawn()),
+        };
+
+        thread.set_title("Renamed from ACP").await?;
+
+        assert_eq!(
+            codex_core::find_thread_name_by_id(&codex_home_abs, &thread_id).await?,
+            Some("Renamed from ACP".to_string())
+        );
+
+        thread.shutdown().await?;
+        std::fs::remove_dir_all(codex_home).ok();
+
+        Ok(())
     }
 
     struct StubAuth;

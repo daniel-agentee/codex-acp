@@ -18,7 +18,8 @@ name = "codex_acp"
 path = "src/lib.rs"
 
 [dependencies]
-agent-client-protocol = { version = "=0.11.1", features = ["unstable"] }
+# Temporary local override until `session/setTitle` is released in the Rust SDK.
+agent-client-protocol = { version = "=0.11.1", path = "../rust-sdk/src/agent-client-protocol", features = ["unstable"] }
 anyhow = "1"
 clap = "4"
 codex-apply-patch = { git = "https://github.com/openai/codex", tag = "rust-v0.129.0" }

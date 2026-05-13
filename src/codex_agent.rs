@@ -9,14 +9,15 @@ use acp::schema::{
     SessionCapabilities, SessionCloseCapabilities, SessionId, SessionInfo, SessionListCapabilities,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
     SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
+    SetSessionTitleRequest, SetSessionTitleResponse,
 };
 use acp::{Agent, Client, ConnectTo, ConnectionTo, Error};
 use agent_client_protocol as acp;
 use codex_config::{McpServerConfig, McpServerTransportConfig};
 use codex_core::{
     NewThread, RolloutRecorder, SortDirection, StateDbHandle, ThreadManager, ThreadSortKey,
-    config::Config, find_thread_path_by_id_str, init_state_db, parse_cursor,
-    resolve_installation_id, thread_store_from_config,
+    config::Config, find_thread_name_by_id, find_thread_path_by_id_str, init_state_db,
+    parse_cursor, resolve_installation_id, thread_store_from_config,
 };
 use codex_exec_server::{EnvironmentManager, EnvironmentManagerArgs, ExecServerRuntimePaths};
 use codex_login::{
@@ -267,6 +268,21 @@ impl CodexAgent {
                         let agent = agent.clone();
                         cx.spawn(async move {
                             responder.respond_with_result(agent.set_session_model(request).await)
+                        })?;
+                        Ok(())
+                    }
+                },
+                acp::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let agent = agent.clone();
+                    async move |request: SetSessionTitleRequest,
+                                responder,
+                                cx: ConnectionTo<Client>| {
+                        let agent = agent.clone();
+                        cx.spawn(async move {
+                            responder.respond_with_result(agent.set_session_title(request).await)
                         })?;
                         Ok(())
                     }
@@ -697,32 +713,36 @@ impl CodexAgent {
         .await
         .map_err(|err| Error::internal_error().data(format!("failed to list sessions: {err}")))?;
 
-        let sessions = page
-            .items
-            .into_iter()
-            .filter_map(|item| {
-                let thread_id = item.thread_id?;
-                let item_cwd = item.cwd?;
+        let mut sessions = Vec::new();
+        for item in page.items {
+            let Some(thread_id) = item.thread_id else {
+                continue;
+            };
+            let Some(item_cwd) = item.cwd else {
+                continue;
+            };
 
-                if let Some(filter_cwd) = cwd.as_ref()
-                    && item_cwd != *filter_cwd
-                {
-                    return None;
-                }
+            if let Some(filter_cwd) = cwd.as_ref()
+                && item_cwd != *filter_cwd
+            {
+                continue;
+            }
 
-                let title = item
+            let title = match find_thread_name_by_id(&self.config.codex_home, &thread_id).await {
+                Ok(Some(title)) if !title.trim().is_empty() => Some(title),
+                Ok(_) | Err(_) => item
                     .first_user_message
                     .as_deref()
-                    .and_then(format_session_title);
-                let updated_at = item.updated_at.or(item.created_at);
+                    .and_then(format_session_title),
+            };
+            let updated_at = item.updated_at.or(item.created_at);
 
-                Some(
-                    SessionInfo::new(SessionId::new(thread_id.to_string()), item_cwd)
-                        .title(title)
-                        .updated_at(updated_at),
-                )
-            })
-            .collect::<Vec<_>>();
+            sessions.push(
+                SessionInfo::new(SessionId::new(thread_id.to_string()), item_cwd)
+                    .title(title)
+                    .updated_at(updated_at),
+            );
+        }
 
         let next_cursor = page
             .next_cursor
@@ -792,6 +812,37 @@ impl CodexAgent {
             .await?;
 
         Ok(SetSessionModelResponse::default())
+    }
+
+    async fn set_session_title(
+        &self,
+        args: SetSessionTitleRequest,
+    ) -> Result<SetSessionTitleResponse, Error> {
+        info!("Setting session title for session: {}", args.session_id);
+
+        let thread = self.get_thread(&args.session_id)?;
+        let thread_id =
+            ThreadId::from_string(&args.session_id.0).map_err(Error::into_internal_error)?;
+
+        if let Some(state_db) = self.state_db.as_deref() {
+            match state_db.update_thread_title(thread_id, &args.title).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    debug!(
+                        "Thread metadata unavailable before title update for session: {}",
+                        args.session_id
+                    );
+                }
+                Err(err) => {
+                    return Err(Error::internal_error()
+                        .data(format!("failed to update thread title: {err}")));
+                }
+            }
+        }
+
+        thread.set_title(args.title).await?;
+
+        Ok(SetSessionTitleResponse::default())
     }
 
     async fn set_session_config_option(
