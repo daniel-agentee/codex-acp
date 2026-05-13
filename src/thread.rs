@@ -17,8 +17,8 @@ use agent_client_protocol::{
         RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
         ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
         SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
-        SessionConfigValueId, SessionId, SessionMode, SessionModeId, SessionModeState,
-        SessionNotification, SessionUpdate, StopReason, Terminal, TextContent,
+        SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode, SessionModeId,
+        SessionModeState, SessionNotification, SessionUpdate, StopReason, Terminal, TextContent,
         TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
         ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
         UsageUpdate,
@@ -3354,6 +3354,13 @@ impl<A: Auth> ThreadActor<A> {
                 Error::internal_error().data(format!("failed to index thread title: {err}"))
             })?;
 
+        // Tell the connected client the title changed so it can repaint the
+        // session list without waiting for the next session/list call.
+        self.client
+            .send_notification(SessionUpdate::SessionInfoUpdate(
+                SessionInfoUpdate::new().title(title),
+            ));
+
         Ok(())
     }
 
@@ -4749,6 +4756,17 @@ mod tests {
             codex_core::find_thread_name_by_id(&codex_home_abs, &thread_id).await?,
             Some("Renamed from ACP".to_string())
         );
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(
+            notifications.iter().any(|n| matches!(
+                &n.update,
+                SessionUpdate::SessionInfoUpdate(update)
+                    if matches!(&update.title, agent_client_protocol::schema::MaybeUndefined::Value(t) if t == "Renamed from ACP")
+            )),
+            "expected a SessionInfoUpdate carrying the new title; got: {notifications:#?}"
+        );
+        drop(notifications);
 
         thread.shutdown().await?;
         std::fs::remove_dir_all(codex_home).ok();
