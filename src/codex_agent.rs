@@ -9,7 +9,7 @@ use acp::schema::{
     ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
     SessionId, SessionInfo, SessionListCapabilities, SessionResumeCapabilities,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse,
+    SetSessionModeResponse, SetSessionTitleRequest, SetSessionTitleResponse,
 };
 use acp::{Agent, Client, ConnectTo, ConnectionTo, Error};
 use agent_client_protocol as acp;
@@ -280,6 +280,21 @@ impl CodexAgent {
                         let agent = agent.clone();
                         cx.spawn(async move {
                             responder.respond_with_result(agent.set_session_mode(request).await)
+                        })?;
+                        Ok(())
+                    }
+                },
+                acp::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let agent = agent.clone();
+                    async move |request: SetSessionTitleRequest,
+                                responder,
+                                cx: ConnectionTo<Client>| {
+                        let agent = agent.clone();
+                        cx.spawn(async move {
+                            responder.respond_with_result(agent.set_session_title(request).await)
                         })?;
                         Ok(())
                     }
@@ -823,6 +838,37 @@ impl CodexAgent {
             .set_mode(args.mode_id)
             .await?;
         Ok(SetSessionModeResponse::default())
+    }
+
+    async fn set_session_title(
+        &self,
+        args: SetSessionTitleRequest,
+    ) -> Result<SetSessionTitleResponse, Error> {
+        info!("Setting session title for session: {}", args.session_id);
+
+        let thread = self.get_thread(&args.session_id)?;
+        let thread_id =
+            ThreadId::from_string(&args.session_id.0).map_err(Error::into_internal_error)?;
+
+        if let Some(state_db) = self.state_db.as_deref() {
+            match state_db.update_thread_title(thread_id, &args.title).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    debug!(
+                        "Thread metadata unavailable before title update for session: {}",
+                        args.session_id
+                    );
+                }
+                Err(err) => {
+                    return Err(Error::internal_error()
+                        .data(format!("failed to update thread title: {err}")));
+                }
+            }
+        }
+
+        thread.set_title(args.title).await?;
+
+        Ok(SetSessionTitleResponse::default())
     }
 
     async fn set_session_config_option(
