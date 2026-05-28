@@ -4757,16 +4757,17 @@ mod tests {
             Some("Renamed from ACP".to_string())
         );
 
-        let notifications = client.notifications.lock().unwrap();
-        assert!(
-            notifications.iter().any(|n| matches!(
-                &n.update,
-                SessionUpdate::SessionInfoUpdate(update)
-                    if matches!(&update.title, agent_client_protocol::schema::MaybeUndefined::Value(t) if t == "Renamed from ACP")
-            )),
-            "expected a SessionInfoUpdate carrying the new title; got: {notifications:#?}"
-        );
-        drop(notifications);
+        {
+            let notifications = client.notifications.lock().unwrap();
+            assert!(
+                notifications.iter().any(|n| matches!(
+                    &n.update,
+                    SessionUpdate::SessionInfoUpdate(update)
+                        if matches!(&update.title, agent_client_protocol::schema::MaybeUndefined::Value(t) if t == "Renamed from ACP")
+                )),
+                "expected a SessionInfoUpdate carrying the new title; got: {notifications:#?}"
+            );
+        }
 
         thread.shutdown().await?;
         std::fs::remove_dir_all(codex_home).ok();

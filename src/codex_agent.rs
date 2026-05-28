@@ -7,15 +7,16 @@ use acp::schema::{
     McpCapabilities, McpServer, McpServerHttp, McpServerStdio, NewSessionRequest,
     NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
     ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
-    SessionId, SessionInfo, SessionListCapabilities, SessionResumeCapabilities,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, SetSessionTitleRequest, SetSessionTitleResponse,
+    SessionId, SessionInfo, SessionInfoUpdate, SessionListCapabilities, SessionNotification,
+    SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
+    SetSessionTitleRequest, SetSessionTitleResponse,
 };
 use acp::{Agent, Client, ConnectTo, ConnectionTo, Error};
 use agent_client_protocol as acp;
 use codex_config::{DEFAULT_MCP_SERVER_ENVIRONMENT_ID, McpServerConfig, McpServerTransportConfig};
 use codex_core::{
-    NewThread, RolloutRecorder, StateDbHandle, ThreadManager, config::Config,
+    NewThread, RolloutRecorder, StateDbHandle, ThreadManager, append_thread_name, config::Config,
     find_thread_path_by_id_str, init_state_db, resolve_installation_id, thread_store_from_config,
 };
 use codex_exec_server::{EnvironmentManager, ExecServerRuntimePaths};
@@ -293,8 +294,15 @@ impl CodexAgent {
                                 responder,
                                 cx: ConnectionTo<Client>| {
                         let agent = agent.clone();
+                        let notification_cx = cx.clone();
                         cx.spawn(async move {
-                            responder.respond_with_result(agent.set_session_title(request).await)
+                            responder.respond_with_result(
+                                agent
+                                    .set_session_title(request, |notification| {
+                                        notification_cx.send_notification(notification)
+                                    })
+                                    .await,
+                            )
                         })?;
                         Ok(())
                     }
@@ -326,13 +334,12 @@ impl CodexAgent {
     }
 
     fn get_thread(&self, session_id: &SessionId) -> Result<Arc<Thread>, Error> {
-        Ok(self
-            .sessions
-            .lock()
-            .unwrap()
-            .get(session_id)
-            .ok_or_else(|| Error::resource_not_found(None))?
-            .clone())
+        self.loaded_thread(session_id)
+            .ok_or_else(|| Error::resource_not_found(None))
+    }
+
+    fn loaded_thread(&self, session_id: &SessionId) -> Option<Arc<Thread>> {
+        self.sessions.lock().unwrap().get(session_id).cloned()
     }
 
     async fn check_auth(&self) -> Result<(), Error> {
@@ -843,20 +850,21 @@ impl CodexAgent {
     async fn set_session_title(
         &self,
         args: SetSessionTitleRequest,
+        notify_client: impl FnOnce(SessionNotification) -> Result<(), Error>,
     ) -> Result<SetSessionTitleResponse, Error> {
         info!("Setting session title for session: {}", args.session_id);
 
-        let thread = self.get_thread(&args.session_id)?;
-        let thread_id =
-            ThreadId::from_string(&args.session_id.0).map_err(Error::into_internal_error)?;
+        let session_id = args.session_id;
+        let title = args.title;
+        let thread_id = ThreadId::from_string(&session_id.0).map_err(Error::into_internal_error)?;
 
         if let Some(state_db) = self.state_db.as_deref() {
-            match state_db.update_thread_title(thread_id, &args.title).await {
+            match state_db.update_thread_title(thread_id, &title).await {
                 Ok(true) => {}
                 Ok(false) => {
                     debug!(
                         "Thread metadata unavailable before title update for session: {}",
-                        args.session_id
+                        session_id
                     );
                 }
                 Err(err) => {
@@ -866,7 +874,19 @@ impl CodexAgent {
             }
         }
 
-        thread.set_title(args.title).await?;
+        if let Some(thread) = self.loaded_thread(&session_id) {
+            thread.set_title(title).await?;
+        } else {
+            append_thread_name(&self.config.codex_home, thread_id, &title)
+                .await
+                .map_err(|err| {
+                    Error::internal_error().data(format!("failed to index thread title: {err}"))
+                })?;
+            notify_client(SessionNotification::new(
+                session_id,
+                SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().title(title)),
+            ))?;
+        }
 
         Ok(SetSessionTitleResponse::default())
     }
@@ -992,6 +1012,12 @@ fn stored_session_title(name: Option<&str>, preview: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use acp::schema::MaybeUndefined;
+    use codex_core::config::ConfigOverrides;
+    use uuid::Uuid;
+
     use super::*;
 
     #[test]
@@ -1012,5 +1038,61 @@ mod tests {
             stored_session_title(Some("  "), "preview"),
             Some("preview".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn set_session_title_persists_unloaded_session() -> anyhow::Result<()> {
+        let codex_home =
+            std::env::temp_dir().join(format!("codex-acp-unloaded-title-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&codex_home)?;
+
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        config.codex_home = codex_home.clone().try_into()?;
+
+        let agent = CodexAgent::new(config, None).await?;
+        let thread_id = ThreadId::default();
+        let session_id = SessionId::new(thread_id.to_string());
+        let notifications = Arc::new(Mutex::new(Vec::new()));
+        let captured_notifications = notifications.clone();
+
+        agent
+            .set_session_title(
+                SetSessionTitleRequest::new(session_id.clone(), "Renamed historical session"),
+                |notification| {
+                    captured_notifications.lock().unwrap().push(notification);
+                    Ok(())
+                },
+            )
+            .await?;
+
+        assert_eq!(
+            codex_core::find_thread_name_by_id(&agent.config.codex_home, &thread_id).await?,
+            Some("Renamed historical session".to_string())
+        );
+
+        let notifications = notifications.lock().unwrap();
+        assert!(
+            notifications.iter().any(|notification| {
+                notification.session_id == session_id
+                    && matches!(
+                        &notification.update,
+                        SessionUpdate::SessionInfoUpdate(update)
+                            if matches!(
+                                &update.title,
+                                MaybeUndefined::Value(title) if title == "Renamed historical session"
+                            )
+                    )
+            }),
+            "expected SessionInfoUpdate for unloaded rename; got: {notifications:#?}"
+        );
+        drop(notifications);
+
+        std::fs::remove_dir_all(codex_home).ok();
+
+        Ok(())
     }
 }

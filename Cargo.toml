@@ -62,5 +62,13 @@ unused = "warn"
 tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "132f5b39c862e3a970f731d709608b3e6276d5f6" }
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "9200079d3b54a1ff51072e24d81fd354f085156f" }
 
+# Temporary: pull `session/setTitle` support before it ships on crates.io.
+# Remove both entries once `agent-client-protocol-schema` and `agent-client-protocol`
+# publish releases containing the new types. Tracking:
+#   - https://github.com/agentclientprotocol/agent-client-protocol/pull/1199 (schema)
+#   - https://github.com/agentclientprotocol/rust-sdk/pull/164 (routing)
+agent-client-protocol-schema = { git = "https://github.com/daniel-agentee/agent-client-protocol", rev = "23977c0193c786d0747464a46b5a561ca15c62e2" }
+agent-client-protocol = { git = "https://github.com/daniel-agentee/rust-sdk", rev = "d28b51bab500b8aad1b38da658c04f705dcd17c3" }
+
 [patch."https://github.com/openai/codex"]
 codex-utils-pty = { path = "vendor/codex-utils-pty" }
