@@ -879,7 +879,10 @@ impl CodexAgent {
         }
 
         if let Some(thread) = loaded_thread {
-            thread.set_title(title).await?;
+            let notification_title = self
+                .notification_title_for_update(thread_id, &title)
+                .await?;
+            thread.set_title(title, notification_title).await?;
         } else {
             if !title_updated_in_state {
                 let rollout_path = find_thread_path_by_id_str(
@@ -909,6 +912,9 @@ impl CodexAgent {
                 }
             }
 
+            let notification_title = self
+                .notification_title_for_update(thread_id, &title)
+                .await?;
             append_thread_name(&self.config.codex_home, thread_id, &title)
                 .await
                 .map_err(|err| {
@@ -916,11 +922,41 @@ impl CodexAgent {
                 })?;
             notify_client(SessionNotification::new(
                 session_id,
-                SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().title(title)),
+                SessionUpdate::SessionInfoUpdate(
+                    SessionInfoUpdate::new().title(notification_title),
+                ),
             ))?;
         }
 
         Ok(SetSessionTitleResponse::default())
+    }
+
+    async fn notification_title_for_update(
+        &self,
+        thread_id: ThreadId,
+        title: &str,
+    ) -> Result<Option<String>, Error> {
+        if !title.trim().is_empty() {
+            return Ok(Some(title.to_string()));
+        }
+
+        if let Some(state_db) = self.state_db.as_deref() {
+            match state_db.get_thread(thread_id).await {
+                Ok(Some(metadata)) => {
+                    return Ok(metadata
+                        .first_user_message
+                        .as_deref()
+                        .and_then(format_session_title));
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    return Err(Error::internal_error()
+                        .data(format!("failed to read thread title fallback: {err}")));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     async fn set_session_config_option(
@@ -1076,7 +1112,11 @@ mod tests {
         );
     }
 
-    fn write_minimal_rollout_with_id(codex_home: &Path, id: Uuid) -> anyhow::Result<PathBuf> {
+    fn write_minimal_rollout_with_id(
+        codex_home: &Path,
+        id: Uuid,
+        user_message: Option<&str>,
+    ) -> anyhow::Result<PathBuf> {
         let sessions = codex_home.join("sessions/2024/01/01");
         std::fs::create_dir_all(&sessions)?;
 
@@ -1099,6 +1139,22 @@ mod tests {
             })
         )?;
 
+        if let Some(message) = user_message {
+            writeln!(
+                writer,
+                "{}",
+                serde_json::json!({
+                    "timestamp": "2024-01-01T00:00:00.000Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": message,
+                        "kind": "plain"
+                    }
+                })
+            )?;
+        }
+
         Ok(file)
     }
 
@@ -1118,7 +1174,7 @@ mod tests {
         let agent = CodexAgent::new(config, None).await?;
         let thread_uuid = Uuid::new_v4();
         let thread_id = ThreadId::from_string(&thread_uuid.to_string())?;
-        write_minimal_rollout_with_id(&codex_home, thread_uuid)?;
+        write_minimal_rollout_with_id(&codex_home, thread_uuid, None)?;
         let session_id = SessionId::new(thread_id.to_string());
         let notifications = Arc::new(Mutex::new(Vec::new()));
         let captured_notifications = notifications.clone();
@@ -1152,6 +1208,68 @@ mod tests {
                     )
             }),
             "expected SessionInfoUpdate for unloaded rename; got: {notifications:#?}"
+        );
+        drop(notifications);
+
+        std::fs::remove_dir_all(codex_home).ok();
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_session_title_clear_notifies_with_fallback_title() -> anyhow::Result<()> {
+        let codex_home =
+            std::env::temp_dir().join(format!("codex-acp-clear-title-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&codex_home)?;
+
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        config.codex_home = codex_home.clone().try_into()?;
+
+        let agent = CodexAgent::new(config, None).await?;
+        let thread_uuid = Uuid::new_v4();
+        let thread_id = ThreadId::from_string(&thread_uuid.to_string())?;
+        write_minimal_rollout_with_id(
+            &codex_home,
+            thread_uuid,
+            Some("Summarize the quarterly plan"),
+        )?;
+        let session_id = SessionId::new(thread_id.to_string());
+        let notifications = Arc::new(Mutex::new(Vec::new()));
+        let captured_notifications = notifications.clone();
+
+        agent
+            .set_session_title(
+                SetSessionTitleRequest::new(session_id.clone(), "   "),
+                |notification| {
+                    captured_notifications.lock().unwrap().push(notification);
+                    Ok(())
+                },
+            )
+            .await?;
+
+        assert_eq!(
+            codex_core::find_thread_name_by_id(&agent.config.codex_home, &thread_id).await?,
+            Some("   ".to_string())
+        );
+
+        let notifications = notifications.lock().unwrap();
+        assert!(
+            notifications.iter().any(|notification| {
+                notification.session_id == session_id
+                    && matches!(
+                        &notification.update,
+                        SessionUpdate::SessionInfoUpdate(update)
+                            if matches!(
+                                &update.title,
+                                MaybeUndefined::Value(title) if title == "Summarize the quarterly plan"
+                            )
+                    )
+            }),
+            "expected SessionInfoUpdate with fallback title after clearing custom title; got: {notifications:#?}"
         );
         drop(notifications);
 

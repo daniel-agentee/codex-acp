@@ -287,6 +287,7 @@ enum ThreadMessage {
     },
     SetTitle {
         title: String,
+        notification_title: Option<String>,
         response_tx: oneshot::Sender<Result<(), Error>>,
     },
     SetConfigOption {
@@ -402,11 +403,16 @@ impl Thread {
             .map_err(|e| Error::internal_error().data(e.to_string()))?
     }
 
-    pub async fn set_title(&self, title: impl Into<String>) -> Result<(), Error> {
+    pub async fn set_title(
+        &self,
+        title: impl Into<String>,
+        notification_title: Option<String>,
+    ) -> Result<(), Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
         let message = ThreadMessage::SetTitle {
             title: title.into(),
+            notification_title,
             response_tx,
         };
         drop(self.message_tx.send(message));
@@ -2867,8 +2873,12 @@ impl<A: Auth> ThreadActor<A> {
                 drop(response_tx.send(result));
                 self.maybe_emit_config_options_update().await;
             }
-            ThreadMessage::SetTitle { title, response_tx } => {
-                let result = self.handle_set_title(title).await;
+            ThreadMessage::SetTitle {
+                title,
+                notification_title,
+                response_tx,
+            } => {
+                let result = self.handle_set_title(title, notification_title).await;
                 drop(response_tx.send(result));
             }
             ThreadMessage::SetConfigOption {
@@ -3344,7 +3354,11 @@ impl<A: Auth> ThreadActor<A> {
         Ok(())
     }
 
-    async fn handle_set_title(&mut self, title: String) -> Result<(), Error> {
+    async fn handle_set_title(
+        &mut self,
+        title: String,
+        notification_title: Option<String>,
+    ) -> Result<(), Error> {
         let thread_id =
             ThreadId::from_string(&self.client.session_id.0).map_err(Error::into_internal_error)?;
 
@@ -3358,7 +3372,7 @@ impl<A: Auth> ThreadActor<A> {
         // session list without waiting for the next session/list call.
         self.client
             .send_notification(SessionUpdate::SessionInfoUpdate(
-                SessionInfoUpdate::new().title(title),
+                SessionInfoUpdate::new().title(notification_title),
             ));
 
         Ok(())
@@ -4750,7 +4764,9 @@ mod tests {
             _handle: tokio::spawn(actor.spawn()),
         };
 
-        thread.set_title("Renamed from ACP").await?;
+        thread
+            .set_title("Renamed from ACP", Some("Renamed from ACP".to_string()))
+            .await?;
 
         assert_eq!(
             codex_core::find_thread_name_by_id(&codex_home_abs, &thread_id).await?,
@@ -4766,6 +4782,66 @@ mod tests {
                         if matches!(&update.title, agent_client_protocol::schema::MaybeUndefined::Value(t) if t == "Renamed from ACP")
                 )),
                 "expected a SessionInfoUpdate carrying the new title; got: {notifications:#?}"
+            );
+        }
+
+        thread.shutdown().await?;
+        std::fs::remove_dir_all(codex_home).ok();
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_set_session_title_clear_emits_null_title() -> anyhow::Result<()> {
+        let thread_id = ThreadId::default();
+        let session_id = SessionId::new(thread_id.to_string());
+        let client = Arc::new(StubClient::new());
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
+        let conversation = Arc::new(StubCodexThread::new());
+        let models_manager = Arc::new(StubModelsManager);
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        let codex_home = std::env::temp_dir().join(format!("codex-acp-clear-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&codex_home)?;
+        config.codex_home = codex_home.clone().try_into()?;
+
+        let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+        let actor = ThreadActor::new(
+            StubAuth,
+            session_client,
+            conversation.clone(),
+            models_manager,
+            config,
+            message_rx,
+            resolution_tx,
+            resolution_rx,
+        );
+
+        let thread = Thread {
+            thread: conversation,
+            message_tx,
+            _handle: tokio::spawn(actor.spawn()),
+        };
+
+        thread.set_title("   ", None).await?;
+
+        {
+            let notifications = client.notifications.lock().unwrap();
+            assert!(
+                notifications.iter().any(|n| matches!(
+                    &n.update,
+                    SessionUpdate::SessionInfoUpdate(update)
+                        if matches!(
+                            &update.title,
+                            agent_client_protocol::schema::MaybeUndefined::Null
+                        )
+                )),
+                "expected a SessionInfoUpdate clearing the title; got: {notifications:#?}"
             );
         }
 
