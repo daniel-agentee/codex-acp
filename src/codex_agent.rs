@@ -1088,6 +1088,7 @@ mod tests {
 
     use acp::schema::MaybeUndefined;
     use codex_core::config::ConfigOverrides;
+    use codex_core::find_thread_name_by_id;
     use uuid::Uuid;
 
     use super::*;
