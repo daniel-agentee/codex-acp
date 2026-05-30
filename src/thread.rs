@@ -26,7 +26,7 @@ use agent_client_protocol::{
 };
 use codex_apply_patch::parse_patch;
 use codex_core::{
-    CodexThread, append_thread_name,
+    CodexThread, StateDbHandle, append_thread_name,
     config::{Config, set_project_trust_level},
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
@@ -322,14 +322,19 @@ pub struct Thread {
     _handle: tokio::task::JoinHandle<()>,
 }
 
+pub(crate) struct ThreadOptions {
+    pub(crate) config: Config,
+    pub(crate) state_db: Option<StateDbHandle>,
+}
+
 impl Thread {
-    pub fn new(
+    pub(crate) fn new(
         session_id: SessionId,
         thread: Arc<dyn CodexThreadImpl>,
         auth: Arc<AuthManager>,
         models_manager: Arc<dyn ModelsManagerImpl>,
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
-        config: Config,
+        options: ThreadOptions,
         cx: ConnectionTo<Client>,
     ) -> Self {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
@@ -340,7 +345,8 @@ impl Thread {
             SessionClient::new(session_id, cx, client_capabilities),
             thread.clone(),
             models_manager,
-            config,
+            options.config,
+            options.state_db,
             message_rx,
             resolution_tx,
             resolution_rx,
@@ -2772,6 +2778,8 @@ struct ThreadActor<A> {
     thread: Arc<dyn CodexThreadImpl>,
     /// The configuration for the thread.
     config: Config,
+    /// Optional SQLite state DB used for DB-backed session metadata updates.
+    state_db: Option<StateDbHandle>,
     /// The models available for this thread.
     models_manager: Arc<dyn ModelsManagerImpl>,
     /// Internal message sender used to route spawned interaction results back to the actor.
@@ -2794,6 +2802,7 @@ impl<A: Auth> ThreadActor<A> {
         thread: Arc<dyn CodexThreadImpl>,
         models_manager: Arc<dyn ModelsManagerImpl>,
         config: Config,
+        state_db: Option<StateDbHandle>,
         message_rx: mpsc::UnboundedReceiver<ThreadMessage>,
         resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
         resolution_rx: mpsc::UnboundedReceiver<ThreadMessage>,
@@ -2803,6 +2812,7 @@ impl<A: Auth> ThreadActor<A> {
             client,
             thread,
             config,
+            state_db,
             models_manager,
             resolution_tx,
             submissions: HashMap::new(),
@@ -2963,6 +2973,11 @@ impl<A: Auth> ThreadActor<A> {
                 "summarize conversation to prevent hitting the context limit",
             ),
             AvailableCommand::new("logout", "logout of Codex"),
+            AvailableCommand::new("rename", "rename this session").input(
+                AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                    "new session title",
+                )),
+            ),
         ]
     }
 
@@ -3271,6 +3286,28 @@ impl<A: Auth> ThreadActor<A> {
                     self.auth.logout().await?;
                     return Err(Error::auth_required());
                 }
+                "rename" => {
+                    let title = rest.trim();
+                    if title.is_empty() {
+                        self.client
+                            .send_agent_text("Usage: /rename <new session title>\n");
+                    } else {
+                        match self
+                            .handle_set_title(title.to_owned(), Some(title.to_owned()))
+                            .await
+                        {
+                            Ok(()) => self
+                                .client
+                                .send_agent_text(format!("Renamed session to \"{title}\".\n")),
+                            Err(err) => self.client.send_agent_text(format!(
+                                "Failed to rename session: {}\n",
+                                err.message
+                            )),
+                        }
+                    }
+                    drop(response_tx.send(Ok(StopReason::EndTurn)));
+                    return Ok(response_rx);
+                }
                 _ => {
                     op = Op::UserInput {
                         items,
@@ -3361,6 +3398,15 @@ impl<A: Auth> ThreadActor<A> {
     ) -> Result<(), Error> {
         let thread_id =
             ThreadId::from_string(&self.client.session_id.0).map_err(Error::into_internal_error)?;
+
+        if let Some(state_db) = self.state_db.as_deref() {
+            state_db
+                .update_thread_title(thread_id, &title)
+                .await
+                .map_err(|err| {
+                    Error::internal_error().data(format!("failed to update thread title: {err}"))
+                })?;
+        }
 
         append_thread_name(&self.config.codex_home, thread_id, &title)
             .await
@@ -4162,7 +4208,8 @@ fn extract_slash_command(content: &[UserInput]) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::path::PathBuf;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
@@ -4174,6 +4221,32 @@ mod tests {
     use tokio::sync::{Mutex, Notify, mpsc::UnboundedSender};
 
     use super::*;
+
+    fn write_minimal_rollout_with_id(codex_home: &Path, id: Uuid) -> anyhow::Result<PathBuf> {
+        let sessions = codex_home.join("sessions/2024/01/01");
+        std::fs::create_dir_all(&sessions)?;
+
+        let file = sessions.join(format!("rollout-2024-01-01T00-00-00-{id}.jsonl"));
+        let mut writer = std::fs::File::create(&file)?;
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "timestamp": "2024-01-01T00:00:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id.to_string(),
+                    "timestamp": "2024-01-01T00:00:00Z",
+                    "cwd": ".",
+                    "originator": "test",
+                    "cli_version": "test",
+                    "model_provider": "test-provider"
+                }
+            })
+        )?;
+
+        Ok(file)
+    }
 
     #[tokio::test]
     async fn test_prompt() -> anyhow::Result<()> {
@@ -4333,6 +4406,140 @@ mod tests {
         let ops = thread.ops.lock().unwrap();
         assert_eq!(ops.as_slice(), &[Op::Compact]);
 
+        Ok(())
+    }
+
+    #[test]
+    fn rename_is_listed_in_builtin_commands() {
+        let commands = ThreadActor::<StubAuth>::builtin_commands();
+        let rename = commands
+            .iter()
+            .find(|c| c.name == "rename")
+            .expect("rename builtin should be exposed");
+        assert!(
+            rename.input.is_some(),
+            "rename should advertise an unstructured input field for the new title"
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_rename_without_arg_shows_usage_message() -> anyhow::Result<()> {
+        let (session_id, client, _thread, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/rename".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(
+            notifications.iter().any(|notification| matches!(
+                &notification.update,
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) if text.contains("Usage: /rename")
+            )),
+            "expected a usage message for `/rename` with no argument; got: {notifications:#?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn slash_rename_with_arg_writes_title_to_session_index_and_state_db() -> anyhow::Result<()>
+    {
+        let thread_uuid = Uuid::new_v4();
+        let thread_id = ThreadId::from_string(&thread_uuid.to_string())?;
+        let session_id = SessionId::new(thread_id.to_string());
+        let client = Arc::new(StubClient::new());
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
+        let conversation = Arc::new(StubCodexThread::new());
+        let models_manager = Arc::new(StubModelsManager);
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        let codex_home =
+            std::env::temp_dir().join(format!("codex-acp-slash-rename-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&codex_home)?;
+        config.codex_home = codex_home.clone().try_into()?;
+        let codex_home_abs = config.codex_home.clone();
+        let state_db = codex_core::init_state_db(&config)
+            .await
+            .expect("test config should initialize a state DB");
+        write_minimal_rollout_with_id(&codex_home, thread_uuid)?;
+        let rollout_path = codex_core::find_thread_path_by_id_str(
+            &codex_home_abs,
+            session_id.0.as_ref(),
+            Some(&state_db),
+        )
+        .await?;
+        assert!(rollout_path.is_some());
+        assert!(
+            state_db
+                .update_thread_title(thread_id, "Old DB title")
+                .await?
+        );
+
+        let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+        let actor = ThreadActor::new(
+            StubAuth,
+            session_client,
+            conversation.clone(),
+            models_manager,
+            config,
+            Some(state_db.clone()),
+            message_rx,
+            resolution_tx,
+            resolution_rx,
+        );
+        let _handle = tokio::spawn(actor.spawn());
+
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(
+                session_id.clone(),
+                vec!["/rename Quarterly review thread".into()],
+            ),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        assert_eq!(
+            codex_core::find_thread_name_by_id(&codex_home_abs, &thread_id).await?,
+            Some("Quarterly review thread".to_string())
+        );
+        let metadata = state_db
+            .get_thread(thread_id)
+            .await?
+            .expect("state DB should keep the renamed thread metadata");
+        assert_eq!(metadata.title, "Quarterly review thread");
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(
+            notifications.iter().any(|notification| matches!(
+                &notification.update,
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) if text.contains("Renamed session to") && text.contains("Quarterly review thread")
+            )),
+            "expected a confirmation message for `/rename`; got: {notifications:#?}"
+        );
+
+        std::fs::remove_dir_all(codex_home).ok();
         Ok(())
     }
 
@@ -4717,6 +4924,7 @@ mod tests {
             conversation.clone(),
             models_manager,
             config,
+            None,
             message_rx,
             resolution_tx,
             resolution_rx,
@@ -4753,6 +4961,7 @@ mod tests {
             conversation.clone(),
             models_manager,
             config,
+            None,
             message_rx,
             resolution_tx,
             resolution_rx,
@@ -4817,6 +5026,7 @@ mod tests {
             conversation.clone(),
             models_manager,
             config,
+            None,
             message_rx,
             resolution_tx,
             resolution_rx,
@@ -5824,6 +6034,7 @@ mod tests {
             conversation.clone(),
             models_manager,
             config,
+            None,
             message_rx,
             resolution_tx,
             resolution_rx,
