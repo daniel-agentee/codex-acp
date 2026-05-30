@@ -857,10 +857,14 @@ impl CodexAgent {
         let session_id = args.session_id;
         let title = args.title;
         let thread_id = ThreadId::from_string(&session_id.0).map_err(Error::into_internal_error)?;
+        let loaded_thread = self.loaded_thread(&session_id);
+        let mut title_updated_in_state = false;
 
         if let Some(state_db) = self.state_db.as_deref() {
             match state_db.update_thread_title(thread_id, &title).await {
-                Ok(true) => {}
+                Ok(true) => {
+                    title_updated_in_state = true;
+                }
                 Ok(false) => {
                     debug!(
                         "Thread metadata unavailable before title update for session: {}",
@@ -874,9 +878,37 @@ impl CodexAgent {
             }
         }
 
-        if let Some(thread) = self.loaded_thread(&session_id) {
+        if let Some(thread) = loaded_thread {
             thread.set_title(title).await?;
         } else {
+            if !title_updated_in_state {
+                let rollout_path = find_thread_path_by_id_str(
+                    &self.config.codex_home,
+                    session_id.0.as_ref(),
+                    self.state_db.as_deref(),
+                )
+                .await
+                .map_err(|err| {
+                    Error::internal_error().data(format!(
+                        "failed to locate thread before title update: {err}"
+                    ))
+                })?;
+
+                if rollout_path.is_none() {
+                    return Err(Error::resource_not_found(None));
+                }
+
+                if let Some(state_db) = self.state_db.as_deref() {
+                    match state_db.update_thread_title(thread_id, &title).await {
+                        Ok(_) => {}
+                        Err(err) => {
+                            return Err(Error::internal_error()
+                                .data(format!("failed to update thread title: {err}")));
+                        }
+                    }
+                }
+            }
+
             append_thread_name(&self.config.codex_home, thread_id, &title)
                 .await
                 .map_err(|err| {
@@ -1012,7 +1044,11 @@ fn stored_session_title(name: Option<&str>, preview: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        io::Write,
+        path::{Path, PathBuf},
+        sync::{Arc, Mutex},
+    };
 
     use acp::schema::MaybeUndefined;
     use codex_core::config::ConfigOverrides;
@@ -1040,6 +1076,32 @@ mod tests {
         );
     }
 
+    fn write_minimal_rollout_with_id(codex_home: &Path, id: Uuid) -> anyhow::Result<PathBuf> {
+        let sessions = codex_home.join("sessions/2024/01/01");
+        std::fs::create_dir_all(&sessions)?;
+
+        let file = sessions.join(format!("rollout-2024-01-01T00-00-00-{id}.jsonl"));
+        let mut writer = std::fs::File::create(&file)?;
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "timestamp": "2024-01-01T00:00:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id.to_string(),
+                    "timestamp": "2024-01-01T00:00:00Z",
+                    "cwd": ".",
+                    "originator": "test",
+                    "cli_version": "test",
+                    "model_provider": "test-provider"
+                }
+            })
+        )?;
+
+        Ok(file)
+    }
+
     #[tokio::test]
     async fn set_session_title_persists_unloaded_session() -> anyhow::Result<()> {
         let codex_home =
@@ -1054,7 +1116,9 @@ mod tests {
         config.codex_home = codex_home.clone().try_into()?;
 
         let agent = CodexAgent::new(config, None).await?;
-        let thread_id = ThreadId::default();
+        let thread_uuid = Uuid::new_v4();
+        let thread_id = ThreadId::from_string(&thread_uuid.to_string())?;
+        write_minimal_rollout_with_id(&codex_home, thread_uuid)?;
         let session_id = SessionId::new(thread_id.to_string());
         let notifications = Arc::new(Mutex::new(Vec::new()));
         let captured_notifications = notifications.clone();
@@ -1090,6 +1154,51 @@ mod tests {
             "expected SessionInfoUpdate for unloaded rename; got: {notifications:#?}"
         );
         drop(notifications);
+
+        std::fs::remove_dir_all(codex_home).ok();
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_session_title_rejects_missing_unloaded_session() -> anyhow::Result<()> {
+        let codex_home =
+            std::env::temp_dir().join(format!("codex-acp-missing-title-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&codex_home)?;
+
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        config.codex_home = codex_home.clone().try_into()?;
+
+        let agent = CodexAgent::new(config, None).await?;
+        let thread_id = ThreadId::default();
+        let session_id = SessionId::new(thread_id.to_string());
+        let notifications = Arc::new(Mutex::new(Vec::new()));
+        let captured_notifications = notifications.clone();
+
+        let result = agent
+            .set_session_title(
+                SetSessionTitleRequest::new(session_id, "Orphan title"),
+                |notification| {
+                    captured_notifications.lock().unwrap().push(notification);
+                    Ok(())
+                },
+            )
+            .await;
+
+        let err = match result {
+            Ok(_) => panic!("expected missing unloaded session to be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code, acp::ErrorCode::ResourceNotFound);
+        assert_eq!(
+            codex_core::find_thread_name_by_id(&agent.config.codex_home, &thread_id).await?,
+            None
+        );
+        assert!(notifications.lock().unwrap().is_empty());
 
         std::fs::remove_dir_all(codex_home).ok();
 
