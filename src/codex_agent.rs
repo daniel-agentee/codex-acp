@@ -8,9 +8,9 @@ use acp::schema::{
     NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
     ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
     SessionId, SessionInfo, SessionInfoUpdate, SessionListCapabilities, SessionNotification,
-    SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
-    SetSessionTitleRequest, SetSessionTitleResponse,
+    SessionResumeCapabilities, SessionSetTitleCapabilities, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    SetSessionModeResponse, SetSessionTitleRequest, SetSessionTitleResponse,
 };
 use acp::{Agent, Client, ConnectTo, ConnectionTo, Error};
 use agent_client_protocol as acp;
@@ -480,7 +480,8 @@ impl CodexAgent {
         agent_capabilities.session_capabilities = SessionCapabilities::new()
             .close(SessionCloseCapabilities::new())
             .list(SessionListCapabilities::new())
-            .resume(SessionResumeCapabilities::new());
+            .resume(SessionResumeCapabilities::new())
+            .set_title(SessionSetTitleCapabilities::new());
 
         let mut auth_methods = vec![
             CodexAuthMethod::ChatGpt.into(),
@@ -853,6 +854,7 @@ impl CodexAgent {
         notify_client: impl FnOnce(SessionNotification) -> Result<(), Error>,
     ) -> Result<SetSessionTitleResponse, Error> {
         info!("Setting session title for session: {}", args.session_id);
+        self.check_auth().await?;
 
         let session_id = args.session_id;
         let title = args.title;
@@ -879,9 +881,7 @@ impl CodexAgent {
         }
 
         if let Some(thread) = loaded_thread {
-            let notification_title = self
-                .notification_title_for_update(thread_id, &title)
-                .await?;
+            let notification_title = notification_title_for_update(&title);
             thread.set_title(title, notification_title).await?;
         } else {
             if !title_updated_in_state {
@@ -912,9 +912,7 @@ impl CodexAgent {
                 }
             }
 
-            let notification_title = self
-                .notification_title_for_update(thread_id, &title)
-                .await?;
+            let notification_title = notification_title_for_update(&title);
             append_thread_name(&self.config.codex_home, thread_id, &title)
                 .await
                 .map_err(|err| {
@@ -929,34 +927,6 @@ impl CodexAgent {
         }
 
         Ok(SetSessionTitleResponse::default())
-    }
-
-    async fn notification_title_for_update(
-        &self,
-        thread_id: ThreadId,
-        title: &str,
-    ) -> Result<Option<String>, Error> {
-        if !title.trim().is_empty() {
-            return Ok(Some(title.to_string()));
-        }
-
-        if let Some(state_db) = self.state_db.as_deref() {
-            match state_db.get_thread(thread_id).await {
-                Ok(Some(metadata)) => {
-                    return Ok(metadata
-                        .first_user_message
-                        .as_deref()
-                        .and_then(format_session_title));
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    return Err(Error::internal_error()
-                        .data(format!("failed to read thread title fallback: {err}")));
-                }
-            }
-        }
-
-        Ok(None)
     }
 
     async fn set_session_config_option(
@@ -1072,10 +1042,19 @@ fn format_session_title(message: &str) -> Option<String> {
 }
 
 fn stored_session_title(name: Option<&str>, preview: &str) -> Option<String> {
-    [name, Some(preview)]
-        .into_iter()
-        .flatten()
-        .find_map(format_session_title)
+    match name {
+        Some(name) if name.trim().is_empty() => None,
+        Some(name) => format_session_title(name),
+        None => format_session_title(preview),
+    }
+}
+
+fn notification_title_for_update(title: &str) -> Option<String> {
+    if title.trim().is_empty() {
+        None
+    } else {
+        Some(title.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -1102,15 +1081,16 @@ mod tests {
     }
 
     #[test]
-    fn stored_session_title_falls_back_to_preview() {
+    fn stored_session_title_falls_back_to_preview_when_name_is_absent() {
         assert_eq!(
             stored_session_title(None, "preview"),
             Some("preview".to_string())
         );
-        assert_eq!(
-            stored_session_title(Some("  "), "preview"),
-            Some("preview".to_string())
-        );
+    }
+
+    #[test]
+    fn stored_session_title_preserves_explicitly_cleared_name() {
+        assert_eq!(stored_session_title(Some("  "), "preview"), None);
     }
 
     fn write_minimal_rollout_with_id(
@@ -1171,6 +1151,7 @@ mod tests {
         )
         .await?;
         config.codex_home = codex_home.clone().try_into()?;
+        config.model_provider_id = "test-provider".to_string();
 
         let agent = CodexAgent::new(config, None).await?;
         let thread_uuid = Uuid::new_v4();
@@ -1218,7 +1199,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_session_title_clear_notifies_with_fallback_title() -> anyhow::Result<()> {
+    async fn set_session_title_persists_db_backed_unloaded_session_to_name_index()
+    -> anyhow::Result<()> {
+        let codex_home =
+            std::env::temp_dir().join(format!("codex-acp-db-backed-title-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&codex_home)?;
+
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        config.codex_home = codex_home.clone().try_into()?;
+        config.model_provider_id = "test-provider".to_string();
+
+        let agent = CodexAgent::new(config, None).await?;
+        let thread_uuid = Uuid::new_v4();
+        let thread_id = ThreadId::from_string(&thread_uuid.to_string())?;
+        let rollout_path = write_minimal_rollout_with_id(&codex_home, thread_uuid, None)?;
+        let session_id = SessionId::new(thread_id.to_string());
+
+        agent
+            .set_session_title(
+                SetSessionTitleRequest::new(session_id.clone(), "Seed DB metadata"),
+                |_| Ok(()),
+            )
+            .await?;
+
+        std::fs::remove_file(rollout_path)?;
+        std::fs::remove_file(codex_home.join("session_index.jsonl"))?;
+
+        agent
+            .set_session_title(
+                SetSessionTitleRequest::new(session_id, "DB backed title"),
+                |_| Ok(()),
+            )
+            .await?;
+
+        assert_eq!(
+            find_thread_name_by_id(&agent.config.codex_home, &thread_id).await?,
+            Some("DB backed title".to_string())
+        );
+
+        std::fs::remove_dir_all(codex_home).ok();
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_session_title_clear_notifies_with_cleared_title() -> anyhow::Result<()> {
         let codex_home =
             std::env::temp_dir().join(format!("codex-acp-clear-title-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&codex_home)?;
@@ -1229,6 +1258,7 @@ mod tests {
         )
         .await?;
         config.codex_home = codex_home.clone().try_into()?;
+        config.model_provider_id = "test-provider".to_string();
 
         let agent = CodexAgent::new(config, None).await?;
         let thread_uuid = Uuid::new_v4();
@@ -1264,13 +1294,10 @@ mod tests {
                     && matches!(
                         &notification.update,
                         SessionUpdate::SessionInfoUpdate(update)
-                            if matches!(
-                                &update.title,
-                                MaybeUndefined::Value(title) if title == "Summarize the quarterly plan"
-                            )
+                            if matches!(&update.title, MaybeUndefined::Null)
                     )
             }),
-            "expected SessionInfoUpdate with fallback title after clearing custom title; got: {notifications:#?}"
+            "expected SessionInfoUpdate with cleared title after clearing custom title; got: {notifications:#?}"
         );
         drop(notifications);
 
@@ -1291,6 +1318,7 @@ mod tests {
         )
         .await?;
         config.codex_home = codex_home.clone().try_into()?;
+        config.model_provider_id = "test-provider".to_string();
 
         let agent = CodexAgent::new(config, None).await?;
         let thread_id = ThreadId::default();
@@ -1315,6 +1343,55 @@ mod tests {
         assert_eq!(err.code, acp::ErrorCode::ResourceNotFound);
         assert_eq!(
             codex_core::find_thread_name_by_id(&agent.config.codex_home, &thread_id).await?,
+            None
+        );
+        assert!(notifications.lock().unwrap().is_empty());
+
+        std::fs::remove_dir_all(codex_home).ok();
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_session_title_requires_authentication_before_metadata_update() -> anyhow::Result<()>
+    {
+        let codex_home =
+            std::env::temp_dir().join(format!("codex-acp-auth-title-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&codex_home)?;
+
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        config.codex_home = codex_home.clone().try_into()?;
+        config.model_provider_id = "openai".to_string();
+
+        let agent = CodexAgent::new(config, None).await?;
+        let thread_uuid = Uuid::new_v4();
+        let thread_id = ThreadId::from_string(&thread_uuid.to_string())?;
+        write_minimal_rollout_with_id(&codex_home, thread_uuid, None)?;
+        let session_id = SessionId::new(thread_id.to_string());
+        let notifications = Arc::new(Mutex::new(Vec::new()));
+        let captured_notifications = notifications.clone();
+
+        let result = agent
+            .set_session_title(
+                SetSessionTitleRequest::new(session_id, "Unauthenticated title"),
+                |notification| {
+                    captured_notifications.lock().unwrap().push(notification);
+                    Ok(())
+                },
+            )
+            .await;
+
+        let err = match result {
+            Ok(_) => panic!("expected unauthenticated title update to be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code, acp::ErrorCode::AuthRequired);
+        assert_eq!(
+            find_thread_name_by_id(&agent.config.codex_home, &thread_id).await?,
             None
         );
         assert!(notifications.lock().unwrap().is_empty());
