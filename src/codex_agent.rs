@@ -1050,11 +1050,7 @@ fn stored_session_title(name: Option<&str>, preview: &str) -> Option<String> {
 }
 
 fn notification_title_for_update(title: &str) -> Option<String> {
-    if title.trim().is_empty() {
-        None
-    } else {
-        Some(title.to_string())
-    }
+    format_session_title(title)
 }
 
 #[cfg(test)]
@@ -1091,6 +1087,19 @@ mod tests {
     #[test]
     fn stored_session_title_preserves_explicitly_cleared_name() {
         assert_eq!(stored_session_title(Some("  "), "preview"), None);
+    }
+
+    #[test]
+    fn notification_title_for_update_matches_session_list_formatting() {
+        assert_eq!(
+            notification_title_for_update("  custom\ntitle  "),
+            Some("custom title".to_string())
+        );
+        assert_eq!(notification_title_for_update("   "), None);
+
+        let long_title = "a".repeat(SESSION_TITLE_MAX_GRAPHEMES + 1);
+        let expected = format!("{}...", "a".repeat(SESSION_TITLE_MAX_GRAPHEMES - 3));
+        assert_eq!(notification_title_for_update(&long_title), Some(expected));
     }
 
     fn write_minimal_rollout_with_id(
