@@ -84,6 +84,7 @@ use itertools::Itertools;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
+use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
 /// Abstraction over the ACP connection for sending notifications and requests
@@ -114,6 +115,7 @@ impl ClientSender for AcpConnection {
 
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
 const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
+const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
 const CODEX_READ_ONLY_PROFILE_ID: &str = ":read-only";
 const CODEX_WORKSPACE_PROFILE_ID: &str = ":workspace";
 const CODEX_DANGER_NO_SANDBOX_PROFILE_ID: &str = ":danger-no-sandbox";
@@ -208,6 +210,40 @@ fn current_session_mode_id(config: &Config) -> Option<SessionModeId> {
 
 fn mode_trusts_project(mode_id: &str) -> bool {
     matches!(mode_id, "auto" | "full-access")
+}
+
+fn truncate_title_graphemes(text: &str, max_graphemes: usize) -> String {
+    let mut graphemes = text.grapheme_indices(true);
+
+    if let Some((byte_index, _)) = graphemes.nth(max_graphemes) {
+        if max_graphemes >= 3 {
+            let mut truncate_graphemes = text.grapheme_indices(true);
+            if let Some((truncate_byte_index, _)) = truncate_graphemes.nth(max_graphemes - 3) {
+                let truncated = &text[..truncate_byte_index];
+                format!("{truncated}...")
+            } else {
+                text.to_string()
+            }
+        } else {
+            let truncated = &text[..byte_index];
+            truncated.to_string()
+        }
+    } else {
+        text.to_string()
+    }
+}
+
+fn notification_title_for_rename(title: &str) -> Option<String> {
+    let normalized = title.replace(['\r', '\n'], " ");
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(truncate_title_graphemes(
+            trimmed,
+            SESSION_TITLE_MAX_GRAPHEMES,
+        ))
+    }
 }
 
 /// Trait for abstracting over the `CodexThread` to make testing easier.
@@ -3292,8 +3328,9 @@ impl<A: Auth> ThreadActor<A> {
                         self.client
                             .send_agent_text("Usage: /rename <new session title>\n");
                     } else {
+                        let notification_title = notification_title_for_rename(title);
                         match self
-                            .handle_set_title(title.to_owned(), Some(title.to_owned()))
+                            .handle_set_title(title.to_owned(), notification_title)
                             .await
                         {
                             Ok(()) => self
@@ -4422,6 +4459,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rename_notification_title_matches_session_list_formatting() {
+        assert_eq!(
+            notification_title_for_rename("  custom\ntitle  "),
+            Some("custom title".to_string())
+        );
+        assert_eq!(notification_title_for_rename("   "), None);
+
+        let long_title = "a".repeat(SESSION_TITLE_MAX_GRAPHEMES + 1);
+        let expected = format!("{}...", "a".repeat(SESSION_TITLE_MAX_GRAPHEMES - 3));
+        assert_eq!(notification_title_for_rename(&long_title), Some(expected));
+    }
+
     #[tokio::test]
     async fn slash_rename_without_arg_shows_usage_message() -> anyhow::Result<()> {
         let (session_id, client, _thread, message_tx, _handle) = setup().await?;
@@ -4508,7 +4558,7 @@ mod tests {
         message_tx.send(ThreadMessage::Prompt {
             request: PromptRequest::new(
                 session_id.clone(),
-                vec!["/rename Quarterly review thread".into()],
+                vec!["/rename Quarterly\nreview thread".into()],
             ),
             response_tx: prompt_response_tx,
         })?;
@@ -4519,22 +4569,34 @@ mod tests {
 
         assert_eq!(
             codex_core::find_thread_name_by_id(&codex_home_abs, &thread_id).await?,
-            Some("Quarterly review thread".to_string())
+            Some("Quarterly\nreview thread".to_string())
         );
         let metadata = state_db
             .get_thread(thread_id)
             .await?
             .expect("state DB should keep the renamed thread metadata");
-        assert_eq!(metadata.title, "Quarterly review thread");
+        assert_eq!(metadata.title, "Quarterly\nreview thread");
 
         let notifications = client.notifications.lock().unwrap();
+        assert!(
+            notifications.iter().any(|notification| matches!(
+                &notification.update,
+                SessionUpdate::SessionInfoUpdate(update)
+                    if matches!(
+                        &update.title,
+                        agent_client_protocol::schema::MaybeUndefined::Value(title)
+                            if title == "Quarterly review thread"
+                    )
+            )),
+            "expected a normalized SessionInfoUpdate for `/rename`; got: {notifications:#?}"
+        );
         assert!(
             notifications.iter().any(|notification| matches!(
                 &notification.update,
                 SessionUpdate::AgentMessageChunk(ContentChunk {
                     content: ContentBlock::Text(TextContent { text, .. }),
                     ..
-                }) if text.contains("Renamed session to") && text.contains("Quarterly review thread")
+                }) if text.contains("Renamed session to") && text.contains("Quarterly\nreview thread")
             )),
             "expected a confirmation message for `/rename`; got: {notifications:#?}"
         );
